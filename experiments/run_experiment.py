@@ -20,16 +20,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()  # loads GROQ_API_KEY / ANTHROPIC_API_KEY from a local .env file, if present
 
-from src.data_loader import load_rcaeval_case
+from src.data_loader import load_rcaeval_case, load_re2_case
 from src.pipeline import diagnose
 from eval import metrics, plots
 
 
-def find_cases(root, limit=None):
-    """Find every case folder (a leaf directory containing data.csv) under root."""
+def find_cases(root, main_metrics_filename, limit=None):
+    """Find every case folder (a leaf directory containing the dataset's
+    main metrics file) under root. RE1 uses 'data.csv', RE2 uses
+    'simple_metrics.csv' -- discovered by inspecting real downloads."""
     cases = []
     for dirpath, _dirnames, filenames in os.walk(root):
-        if "data.csv" in filenames:
+        if main_metrics_filename in filenames:
             cases.append(dirpath)
     cases.sort()
     if limit:
@@ -39,12 +41,19 @@ def find_cases(root, limit=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", default="data/RE1/RE1-OB",
-                         help="folder to search for cases (default: all Online Boutique RE1 cases)")
+    parser.add_argument("--dataset", choices=["re1", "re2"], default="re1",
+                         help="which RCAEval sub-dataset to run on (re1: metrics only, "
+                              "re2: metrics + real logs)")
+    parser.add_argument("--data-root", default=None,
+                         help="folder to search for cases (default depends on --dataset: "
+                              "data/RE1/RE1-OB for re1, data/RE2/RE2-OB for re2)")
     parser.add_argument("--limit", type=int, default=None,
                          help="only run the first N cases found (useful for a quick smoke test)")
     parser.add_argument("--live", action="store_true",
                          help="use the real LLM instead of the mock hypothesis generator")
+    parser.add_argument("--provider", choices=["groq", "anthropic"], default=None,
+                         help="override config.LLM_PROVIDER for this run (e.g. switch to anthropic "
+                              "if Groq's free-tier daily quota is exhausted)")
     parser.add_argument("--delay", type=float, default=1.0,
                          help="seconds to wait between cases when --live (avoids free-tier rate limits; ignored in mock mode)")
     parser.add_argument("--out", default="results",
@@ -53,8 +62,17 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    cases = find_cases(args.data_root, args.limit)
-    print(f"Found {len(cases)} cases under {args.data_root}")
+    if args.dataset == "re2":
+        loader_fn = load_re2_case
+        main_metrics_filename = "simple_metrics.csv"
+        data_root = args.data_root or "data/RE2/RE2-OB"
+    else:
+        loader_fn = load_rcaeval_case
+        main_metrics_filename = "data.csv"
+        data_root = args.data_root or "data/RE1/RE1-OB"
+
+    cases = find_cases(data_root, main_metrics_filename, args.limit)
+    print(f"Found {len(cases)} cases under {data_root} (dataset={args.dataset})")
     if not cases:
         print("No cases found -- did you download the dataset? See DOWNLOAD_RCAEVAL.md")
         return
@@ -64,7 +82,7 @@ def main():
 
     for i, case_path in enumerate(cases):
         try:
-            incident = load_rcaeval_case(case_path)
+            incident = loader_fn(case_path)
         except Exception as e:
             print(f"  [{i + 1}/{len(cases)}] SKIP {case_path}: failed to load ({e})")
             continue
@@ -78,7 +96,7 @@ def main():
         # need every case's true confidence value to build the risk-coverage
         # curve afterward, by sweeping OUR OWN thresholds over this data.
         try:
-            result = diagnose(incident, live=args.live, confidence_threshold=0.0)
+            result = diagnose(incident, live=args.live, confidence_threshold=0.0, provider=args.provider)
         except Exception as e:
             # One case failing (e.g. the LLM call ran out of retries) should
             # not lose all the other results from a long --live run --
