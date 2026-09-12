@@ -25,6 +25,16 @@ class Hypothesis:
     confidence: float
     supporting_evidence: List[str] = field(default_factory=list)
     contradicting_evidence: List[str] = field(default_factory=list)
+    # Set True on exactly one hypothesis (the raw top pick) right after
+    # initial normalization in pipeline.diagnose(), so the "strong prior"
+    # protection (requiring overwhelming evidence to overturn) can be
+    # applied ONLY to that specific hypothesis, not uniformly to everyone.
+    # A previous attempt applied the stricter rule to all hypotheses
+    # equally, which was a confound: it made every wrong competitor harder
+    # to knock down too, not just the LLM's leader -- found via testing,
+    # results got WORSE in the medium/high confidence buckets instead of
+    # better, the opposite of the intended effect.
+    is_raw_leader: bool = False
 
     def to_dict(self):
         return {
@@ -282,10 +292,40 @@ def _live_generate_hypotheses_groq(incident: dict) -> List[Hypothesis]:
     return _call_with_retry(_call)
 
 
-def generate_hypotheses(incident: dict, live: bool = False) -> List[Hypothesis]:
+def generate_hypotheses(incident: dict, live: bool = False, provider: str = None) -> List[Hypothesis]:
+    """
+    provider: optional override for config.LLM_PROVIDER ("groq" or
+    "anthropic"). Useful for switching providers per-run (e.g. via a
+    --provider CLI flag) without editing config.py -- added after hitting
+    Groq's free-tier daily token cap mid-experiment and needing to fall
+    back to Anthropic without a code edit.
+
+    IMPORTANT: if live=True is requested but no valid API key is found for
+    the selected provider, this used to SILENTLY fall back to mock mode --
+    found via testing: a full 125-case "--live" run produced results
+    bit-for-bit identical to a mock run, with zero errors printed, because
+    the API key wasn't actually set in that shell session. That silent
+    fallback wastes real time and can make you think you got a live-LLM
+    result when you didn't. Now it raises a clear, loud error instead.
+    """
+    provider = provider or config.LLM_PROVIDER
     if live:
-        if config.LLM_PROVIDER == "groq" and os.environ.get("GROQ_API_KEY"):
+        if provider == "groq":
+            if not os.environ.get("GROQ_API_KEY"):
+                raise RuntimeError(
+                    "live=True with provider='groq' but GROQ_API_KEY is not set in "
+                    "this environment. Either export it, put it in a .env file "
+                    "(and confirm load_dotenv() ran), or drop --live to use mock mode "
+                    "on purpose."
+                )
             return _live_generate_hypotheses_groq(incident)
-        if config.LLM_PROVIDER == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
+        if provider == "anthropic":
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise RuntimeError(
+                    "live=True with provider='anthropic' but ANTHROPIC_API_KEY is not "
+                    "set in this environment. Either export it, put it in a .env file "
+                    "(and confirm load_dotenv() ran), or drop --live to use mock mode "
+                    "on purpose."
+                )
             return _live_generate_hypotheses(incident)
     return _mock_generate_hypotheses(incident)

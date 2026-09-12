@@ -77,12 +77,50 @@ def _select_next_check(hypotheses: List[Hypothesis], used_checks: dict) -> Optio
 
 
 def _apply_evidence(hyp: Hypothesis, result: EvidenceResult):
+    """
+    IMPORTANT: the floor after a contradiction is a small positive number
+    (MIN_CONFIDENCE_FLOOR), NOT exactly 0.0. This matters because
+    _normalize() divides each hypothesis's confidence by the sum of ALL
+    hypotheses' confidences -- if a hypothesis is EXACTLY 0.0, it stays
+    EXACTLY 0.0 forever, no matter what happens to every other hypothesis,
+    since 0 divided by anything is still 0. The only way out would be that
+    specific hypothesis getting its own future "support" -- but if the
+    evidence budget runs out before that happens (which is common once you
+    have many hypotheses competing for a limited budget, see
+    _select_next_check's docstring), a single early contradiction becomes a
+    PERMANENT, un-recoverable death sentence.
+
+    Found via testing on real RE2 data: the actual true root cause got
+    contradicted on its very first (and only, due to budget exhaustion)
+    check, and was mathematically locked at 0.0 for the rest of the run --
+    even though the evidence check most likely to support it
+    (topology_consistency) simply never got the chance to run. A small
+    positive floor means a late correction is still mathematically
+    possible, even if the hypothesis never gets its own support again --
+    other hypotheses losing confidence can still lift it slightly, rather
+    than a strict zero staying zero forever.
+
+    STRONG-PRIOR PROTECTION (only for hyp.is_raw_leader): a single
+    contradiction is NOT enough to overturn the LLM's original top pick --
+    it takes config.MIN_CONTRADICTS_TO_OVERTURN net contradictions (i.e.
+    contradictions minus supports) before any penalty is applied at all.
+    This is intentionally NOT applied to other hypotheses -- an earlier
+    version applied it to everyone uniformly, which was a confound (it
+    made wrong competitors harder to knock down too, not just the correct
+    leader) and made results WORSE, not better, at medium/high confidence.
+    """
     if result.verdict == "support":
         hyp.confidence = min(1.0, hyp.confidence + config.SUPPORT_DELTA)
         hyp.supporting_evidence.append(result.reason)
     elif result.verdict == "contradict":
-        hyp.confidence = max(0.0, hyp.confidence + config.CONTRADICT_DELTA)
         hyp.contradicting_evidence.append(result.reason)
+        if hyp.is_raw_leader:
+            net_contradicts = len(hyp.contradicting_evidence) - len(hyp.supporting_evidence)
+            if net_contradicts >= config.MIN_CONTRADICTS_TO_OVERTURN:
+                hyp.confidence = max(config.MIN_CONFIDENCE_FLOOR, hyp.confidence + config.CONTRADICT_DELTA)
+            # else: below the threshold to overturn a strong prior -- no penalty yet
+        else:
+            hyp.confidence = max(config.MIN_CONFIDENCE_FLOOR, hyp.confidence + config.CONTRADICT_DELTA)
     # inconclusive: no change, but you could log it if you want full traceability
 
 
@@ -95,7 +133,8 @@ def _normalize(hypotheses: List[Hypothesis]):
 
 def diagnose(incident: dict, live: bool = False,
              confidence_threshold: float = None,
-             max_queries: int = None) -> DiagnosisResult:
+             max_queries: int = None,
+             provider: str = None) -> DiagnosisResult:
     """Run the full loop on a single incident."""
     # NOTE: must check "is None", not use `confidence_threshold or config...`,
     # because 0.0 is falsy in Python -- the "or" pattern would silently
@@ -104,10 +143,28 @@ def diagnose(incident: dict, live: bool = False,
     # case as "abstained" even when explicitly asking the pipeline to always
     # answer.
     confidence_threshold = confidence_threshold if confidence_threshold is not None else config.CONFIDENCE_THRESHOLD
-    max_queries = max_queries if max_queries is not None else config.MAX_EVIDENCE_QUERIES
 
-    hypotheses = generate_hypotheses(incident, live=live)
+    hypotheses = generate_hypotheses(incident, live=live, provider=provider)
     _normalize(hypotheses)
+
+    # Mark exactly one hypothesis -- the raw top pick, BEFORE any evidence
+    # check runs -- as the "strong prior" that gets extra protection in
+    # _apply_evidence. Must happen here, right after generation, not later,
+    # since the leader can change as evidence comes in and we specifically
+    # want to protect the LLM's ORIGINAL judgment, not whoever happens to
+    # be leading mid-loop.
+    raw_leader = max(hypotheses, key=lambda h: h.confidence)
+    raw_leader.is_raw_leader = True
+
+    # Scale the budget with hypothesis count: a fixed budget doesn't scale
+    # when hypothesis generation proposes many candidates (found via
+    # testing: with a fixed budget of 12 and 10 real hypotheses, most
+    # hypotheses got only 1 check, and 2 of the 4 check types never ran for
+    # ANYONE -- this was confirmed to happen on real RCAEval RE2 data, not
+    # just synthetic stress tests). If the caller passes an explicit
+    # max_queries, that's respected as a hard cap regardless.
+    if max_queries is None:
+        max_queries = max(config.MAX_EVIDENCE_QUERIES, len(hypotheses) * config.MIN_CHECKS_PER_HYPOTHESIS)
 
     used_checks = {h.id: set() for h in hypotheses}
     evidence_trail = []
