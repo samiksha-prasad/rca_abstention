@@ -218,6 +218,134 @@ def _parse_hypothesis_json(text: str) -> List[Hypothesis]:
     return hyps
 
 
+def _build_synthesis_prompt(incident: dict, raw_hypotheses: List[Hypothesis], evidence_trail: list) -> str:
+    """
+    Builds the prompt for the SECOND LLM call in the two-stage design.
+
+    Rationale: the ablation (see chat history / results/ablation_results.csv)
+    found that a rigid arithmetic rule (+0.30 support / -0.35 contradict)
+    for combining rule-based evidence with the LLM's own judgment made
+    accuracy WORSE, not better -- dropping from ~79% (LLM alone) to ~52%
+    (after mechanical verification), with bad flips (breaking a correct
+    guess) far outnumbering good flips (fixing a wrong one), at every
+    confidence level, under two different reweighting designs. This
+    strongly suggests the LLM's own reasoning is more reliable than the
+    fixed formula that was overriding it.
+
+    This function instead gives the LLM the SAME evidence-check results as
+    plain text, and asks IT to decide how much they should matter --
+    testing whether letting the model interpret evidence (rather than a
+    formula silently overruling it) preserves more of its original good
+    judgment while still benefiting from real evidence when the evidence
+    is genuinely strong.
+    """
+    topology_str = json.dumps(incident["topology"], indent=2)
+    alert_text = incident.get("alert_text", "")
+
+    hyps_summary = "\n".join(
+        f"  - {h.service}: your initial guess, confidence {h.confidence:.2f} -- {h.description}"
+        for h in sorted(raw_hypotheses, key=lambda h: -h.confidence)
+    )
+
+    evidence_lines = "\n".join(
+        f"  - [{step['check']}] {step['service']}: {step['verdict']} -- {step['reason']}"
+        for step in evidence_trail
+    )
+
+    return f"""You previously diagnosed a distributed systems incident.
+
+Alert: {alert_text}
+
+Service dependency topology:
+{topology_str}
+
+Your initial hypotheses, ranked by your own confidence:
+{hyps_summary}
+
+A set of independent, rule-based evidence checks were then run. These
+rules are simple and NOT always reliable -- they can be fooled by ordinary
+noise in real telemetry. Use your own judgment about how much to trust
+each one, rather than treating every check result as equally decisive:
+{evidence_lines}
+
+Considering both your own original reasoning AND this evidence (weighing
+each appropriately, including deciding to IGNORE evidence you find
+unconvincing), give your FINAL diagnosis.
+
+Respond ONLY with a JSON object, no other text, in this exact format:
+{{"service": "<final service>", "confidence": <0.0-1.0>, "reasoning": "<short explanation, under 25 words>"}}
+"""
+
+
+def _parse_synthesis_json(text: str) -> dict:
+    """Parser for the synthesis stage's single-object response (not an array,
+    unlike the hypothesis-generation stage)."""
+    text = text.strip()
+    if not text:
+        raise ValueError("LLM returned an empty response (likely rate-limited or a transient API error).")
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.replace("json\n", "", 1)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Synthesis response wasn't valid JSON: {e}. Raw response: {text[:300]!r}") from e
+    return {
+        "service": parsed["service"],
+        "confidence": float(parsed["confidence"]),
+        "reasoning": parsed.get("reasoning", ""),
+    }
+
+
+def synthesize_final_diagnosis(incident, raw_hypotheses, evidence_trail, provider=None) -> dict:
+    """
+    Stage 2 of the two-stage design: calls the LLM once more with the raw
+    hypotheses AND the evidence-check results as plain text, and asks it to
+    produce a final diagnosis using its own judgment about how much to
+    trust each piece of evidence -- rather than a fixed arithmetic formula
+    silently overruling its original guess.
+
+    Live-only (mock mode has no LLM to do this synthesis).
+    """
+    provider = provider or config.LLM_PROVIDER
+    prompt = _build_synthesis_prompt(incident, raw_hypotheses, evidence_trail)
+
+    if provider == "groq":
+        if not os.environ.get("GROQ_API_KEY"):
+            raise RuntimeError("synthesize_final_diagnosis needs GROQ_API_KEY set.")
+        from groq import Groq
+        client = Groq()
+
+        def _call():
+            response = client.chat.completions.create(
+                model=config.GROQ_MODEL,
+                max_tokens=config.MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return _parse_synthesis_json(response.choices[0].message.content)
+
+        return _call_with_retry(_call)
+
+    elif provider == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("synthesize_final_diagnosis needs ANTHROPIC_API_KEY set.")
+        import anthropic
+        client = anthropic.Anthropic()
+
+        def _call():
+            response = client.messages.create(
+                model=config.MODEL_NAME,
+                max_tokens=config.MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(block.text for block in response.content if block.type == "text")
+            return _parse_synthesis_json(text)
+
+        return _call_with_retry(_call)
+
+    raise ValueError(f"Unknown provider: {provider}")
+
+
 def _call_with_retry(fn, max_retries=3, base_delay=2.0):
     """
     Retries a live LLM call with exponential backoff -- specifically for

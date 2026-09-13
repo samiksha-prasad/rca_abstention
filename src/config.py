@@ -65,7 +65,7 @@ NUM_HYPOTHESES = 4  # how many competing hypotheses the LLM proposes per inciden
 # GROQ_API_KEY) -- never hardcode a key into this file or any other.
 LLM_PROVIDER = "groq"
 
-MODEL_NAME = "claude-sonnet-4-6"       # used when LLM_PROVIDER == "anthropic"
+MODEL_NAME = "claude-sonnet-5"          # used when LLM_PROVIDER == "anthropic"
 GROQ_MODEL = "openai/gpt-oss-20b"      # used when LLM_PROVIDER == "groq"
                                         # (fast/cheap; use "openai/gpt-oss-120b"
                                         # for stronger reasoning, at higher cost)
