@@ -87,6 +87,22 @@ def run_case(incident, provider):
     arithmetic_top = max(arithmetic_hyps, key=lambda h: h.confidence)
     arithmetic_guess, arithmetic_confidence = arithmetic_top.service, arithmetic_top.confidence
 
+    # EVIDENCE CONSENSUS: a signal independent of any stated confidence --
+    # simply, how many of the checks that ran against the RAW GUESS
+    # specifically came back "support" vs "contradict"? This tests whether
+    # raw agreement/disagreement among checks predicts correctness better
+    # than the model's own stated confidence (RAW or SYNTHESIS).
+    raw_guess_supports = sum(
+        1 for step in evidence_trail if step["service"] == raw_guess and step["verdict"] == "support"
+    )
+    raw_guess_contradicts = sum(
+        1 for step in evidence_trail if step["service"] == raw_guess and step["verdict"] == "contradict"
+    )
+    raw_guess_inconclusive = sum(
+        1 for step in evidence_trail if step["service"] == raw_guess and step["verdict"] == "inconclusive"
+    )
+    evidence_consensus_net = raw_guess_supports - raw_guess_contradicts
+
     # SYNTHESIS: hand the SAME evidence trail to the LLM, on the ORIGINAL
     # (unmodified) hypotheses, and let it decide the final answer itself.
     synthesis = synthesize_final_diagnosis(incident, hypotheses, evidence_trail, provider=provider)
@@ -96,6 +112,10 @@ def run_case(incident, provider):
         "arithmetic_guess": arithmetic_guess, "arithmetic_confidence": arithmetic_confidence,
         "synthesis_guess": synthesis["service"], "synthesis_confidence": synthesis["confidence"],
         "synthesis_reasoning": synthesis["reasoning"],
+        "raw_guess_supports": raw_guess_supports,
+        "raw_guess_contradicts": raw_guess_contradicts,
+        "raw_guess_inconclusive": raw_guess_inconclusive,
+        "evidence_consensus_net": evidence_consensus_net,
         "num_queries": num_queries,
     }
 
@@ -179,7 +199,7 @@ def main():
         print("No cases completed.")
         return
 
-    results_csv = os.path.join(args.out, "synthesis_results.csv")
+    results_csv = os.path.join(args.out, f"synthesis_results_{args.dataset}.csv")
     with open(results_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(records[0].keys()))
         writer.writeheader()
